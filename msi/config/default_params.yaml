@@ -1,0 +1,151 @@
+# MSI Analysis Pipeline - Default Parameters
+# ==========================================
+# This file contains default parameter values for the MSI analysis pipeline.
+# Modify these values to customize the pipeline for your specific dataset.
+
+# -------------------------------------------
+# Data Paths
+# -------------------------------------------
+paths:
+  # Base data directory
+  base_dir: "~/ext_hd_sammy"
+
+  # Input data locations (relative to base_dir)
+  msi_data:
+    glycans: "data/msi/Glycan OMEtif files"
+    metabolites: "data/msi/Metabolite OMEtif files"
+    peptides: "data/msi/Peptide OMEtif files"
+
+  # Reference images for registration
+  stomics_reference: "data/stomics/gene_exp"
+  he_reference: "data/msi/he"
+
+  # Output directory (relative to base_dir)
+  output_dir: "projects/out/out_msi"
+
+# -------------------------------------------
+# Script 01: Intensity Extraction
+# -------------------------------------------
+extraction:
+  # Minimum intensity threshold for pixel inclusion
+  min_intensity: 1.0
+
+  # File pattern for input images
+  pattern: "*.ome.tif"
+
+  # Parallel processing workers
+  workers_images: 4
+  workers_channels: 8
+
+# -------------------------------------------
+# Script 02: AnnData Creation
+# -------------------------------------------
+anndata:
+  # Join type for merging channels
+  # "outer" = union of all pixels, "inner" = intersection
+  join_type: "outer"
+
+  # Fill value for missing intensities in outer join
+  fill_value: 0.0
+
+# -------------------------------------------
+# Script 03: Preprocessing & QC
+# -------------------------------------------
+preprocessing:
+  # Normalization method
+  # Options: "robust", "zscore", "log", "tic", "none"
+  normalization: "robust"
+
+  # RobustScaler parameters (for robust normalization)
+  robust_quantile_range:
+    - 0.05
+    - 0.95
+
+  # Pixel filtering (by total intensity percentile)
+  min_intensity_percentile: 1
+  max_intensity_percentile: 99
+
+  # Channel filtering (minimum % of non-zero pixels)
+  min_channel_nonzero_pct: 1.0
+
+# -------------------------------------------
+# Script 04: Spatial Analysis
+# -------------------------------------------
+spatial:
+  # Moran's I parameters
+  morans_i:
+    # Number of nearest neighbors for spatial weights
+    knn_k: 6
+
+    # Number of permutations for significance testing
+    n_permutations: 999
+
+    # Maximum p-value for significance
+    p_value_threshold: 0.05
+
+    # Modality-specific Moran's I thresholds
+    thresholds:
+      glycans: 0.2
+      metabolites: 0.05
+      peptides: 0.2
+
+  # Maximum pixels for computation (subsampling)
+  # Set to null to use all pixels
+  max_pixels: 50000
+
+# -------------------------------------------
+# Script 05: Clustering
+# -------------------------------------------
+clustering:
+  # PCA parameters
+  n_pcs: 21
+
+  # Neighbor graph construction
+  n_neighbors: 15
+
+  # Leiden clustering resolution
+  # Lower = fewer clusters, higher = more clusters
+  leiden_resolution: 0.6
+
+  # UMAP parameters
+  umap_min_dist: 0.1
+
+  # Feature selection
+  use_spatially_coherent: true
+  n_top_features: 50
+
+  # Random seed for reproducibility
+  random_state: 42
+
+# -------------------------------------------
+# Script 06: Differential Analysis
+# -------------------------------------------
+differential:
+  # Variance percentile threshold for "variable" channels
+  variance_percentile: 75
+
+  # Minimum samples per group for analysis
+  min_samples_per_group: 2
+
+  # Statistical testing
+  p_value_threshold: 0.05
+  log2_fc_threshold: 1.0
+
+# -------------------------------------------
+# Script 07: Registration
+# -------------------------------------------
+registration:
+  # Composite image creation method
+  # Options: "pca", "snr", "mip"
+  composite_method: "pca"
+
+  # PCA composite parameters
+  pca_n_components: 3
+
+  # SNR composite parameters
+  snr_top_n: 10
+
+  # VALIS registration settings
+  valis:
+    align_to_reference: true
+    max_image_dim: 4096
