@@ -1,0 +1,30 @@
+# MSI Pipeline Requirements for Google Colab
+# Install with: !pip install -r requirements-colab.txt
+#
+# Note: Colab has numpy, pandas, scipy, matplotlib, sklearn pre-installed.
+# This file only installs packages not in Colab or where specific versions are needed.
+
+# NumPy 1.x required - scanpy/anndata not yet compatible with NumPy 2.0
+numpy<2.0
+
+# Protobuf compatibility (avoid MessageFactory.GetPrototype error)
+protobuf>=3.20,<5
+
+# Image I/O (not in Colab)
+tifffile==2023.9.26
+
+# Single-cell / spatial data structures (not in Colab)
+anndata==0.10.3
+scanpy==1.9.6
+
+# Image processing (not in Colab by default)
+scikit-image==0.22.0
+
+# Parquet support (Colab packages need >=15.0.2)
+# Omit to use Colab's pre-installed version
+
+# Statistical visualization (scanpy 1.9.6 excludes seaborn 0.13.0)
+seaborn==0.12.2
+
+# Optional: Image registration (uncomment if needed)
+# valis-wsi==1.0.0

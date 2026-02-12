@@ -20,11 +20,84 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def detect_parquet_format(input_dir: Union[str, Path], sample_id: Optional[str] = None) -> str:
+    """Detect the parquet format: 'single-file' or 'per-channel'.
+
+    Parameters
+    ----------
+    input_dir : str or Path
+        Directory containing parquet files.
+    sample_id : str, optional
+        Sample ID to check for.
+
+    Returns
+    -------
+    format : str
+        'single-file' if a {sample_id}.parquet exists at input_dir level,
+        'per-channel' if subdirectories with .parquet files exist.
+    """
+    input_dir = Path(input_dir)
+
+    # Check for single-file format: {input_dir}/{sample_id}.parquet
+    if sample_id:
+        single_file = input_dir / f"{sample_id}.parquet"
+        if single_file.exists():
+            return 'single-file'
+        # Check for per-channel format: {input_dir}/{sample_id}/*.parquet
+        sample_dir = input_dir / sample_id
+        if sample_dir.is_dir() and list(sample_dir.glob("*.parquet")):
+            return 'per-channel'
+    else:
+        # No sample_id provided - check root dir
+        parquet_files = list(input_dir.glob("*.parquet"))
+        subdirs = [d for d in input_dir.iterdir() if d.is_dir()]
+
+        # If parquet files at root level (not in subdirs), likely single-file format
+        if parquet_files and not subdirs:
+            return 'single-file'
+        if subdirs and any(list(d.glob("*.parquet")) for d in subdirs):
+            return 'per-channel'
+        if parquet_files:
+            return 'single-file'
+
+    return 'unknown'
+
+
+def load_single_file_parquet(
+    filepath: Union[str, Path],
+    fill_value: float = 0.0,
+) -> pd.DataFrame:
+    """Load a single parquet file with all channels as columns.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the parquet file.
+    fill_value : float, default=0.0
+        Value to use for NaN (below-threshold values).
+
+    Returns
+    -------
+    df : pd.DataFrame
+        DataFrame with columns ['x', 'y'] + channel names.
+    """
+    filepath = Path(filepath)
+    df = pd.read_parquet(filepath)
+
+    # Replace NaN with fill_value
+    df = df.fillna(fill_value)
+
+    n_channels = len(df.columns) - 2  # Exclude x, y
+    logger.info(f"Loaded {filepath.name}: {len(df)} pixels x {n_channels} channels")
+
+    return df
+
+
 def load_parquet_channels(
     input_dir: Union[str, Path],
     sample_id: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
-    """Load all parquet channel files from a directory.
+    """Load all parquet channel files from a directory (per-channel format).
 
     Parameters
     ----------
@@ -54,6 +127,51 @@ def load_parquet_channels(
         logger.debug(f"Loaded {channel_name}: {len(df)} rows")
 
     return channels
+
+
+def load_msi_data(
+    input_dir: Union[str, Path],
+    sample_id: str,
+    fill_value: float = 0.0,
+) -> pd.DataFrame:
+    """Load MSI data from parquet files, auto-detecting the format.
+
+    Supports both single-file format (one parquet per image with channels as columns)
+    and per-channel format (directory of parquet files, one per channel).
+
+    Parameters
+    ----------
+    input_dir : str or Path
+        Directory containing parquet files.
+    sample_id : str
+        Sample ID to load.
+    fill_value : float, default=0.0
+        Value for missing intensities.
+
+    Returns
+    -------
+    df : pd.DataFrame
+        DataFrame with columns ['x', 'y'] + channel names.
+    """
+    input_dir = Path(input_dir)
+    format_type = detect_parquet_format(input_dir, sample_id)
+
+    if format_type == 'single-file':
+        filepath = input_dir / f"{sample_id}.parquet"
+        logger.info(f"Detected single-file format for {sample_id}")
+        return load_single_file_parquet(filepath, fill_value=fill_value)
+
+    elif format_type == 'per-channel':
+        logger.info(f"Detected per-channel format for {sample_id}")
+        channels = load_parquet_channels(input_dir, sample_id=sample_id)
+        return merge_channels_to_matrix(channels, fill_value=fill_value)
+
+    else:
+        raise ValueError(
+            f"Could not detect parquet format for sample '{sample_id}' in {input_dir}. "
+            f"Expected either {input_dir}/{sample_id}.parquet (single-file) or "
+            f"{input_dir}/{sample_id}/*.parquet (per-channel)."
+        )
 
 
 def merge_channels_to_matrix(
@@ -186,6 +304,37 @@ def create_anndata_from_merged(
     logger.info(f"Created AnnData: {adata.n_obs} pixels x {adata.n_vars} channels")
 
     return adata
+
+
+def load_msi_to_anndata(
+    input_dir: Union[str, Path],
+    sample_id: str,
+    modality: Optional[str] = None,
+    fill_value: float = 0.0,
+) -> 'ad.AnnData':
+    """Load MSI data from parquet and convert directly to AnnData.
+
+    This is a convenience function that auto-detects the format and creates
+    an AnnData object in one step.
+
+    Parameters
+    ----------
+    input_dir : str or Path
+        Directory containing parquet files.
+    sample_id : str
+        Sample ID to load.
+    modality : str, optional
+        Data modality (e.g., 'glycans', 'metabolites', 'peptides').
+    fill_value : float, default=0.0
+        Value for missing intensities.
+
+    Returns
+    -------
+    adata : AnnData
+        Annotated data matrix.
+    """
+    df = load_msi_data(input_dir, sample_id, fill_value=fill_value)
+    return create_anndata_from_merged(df, sample_id=sample_id, modality=modality)
 
 
 def save_anndata(

@@ -15,9 +15,17 @@ Usage:
         --workers-images 4 \
         --workers-channels 8
 
-Output:
-    Creates per-channel parquet files with columns: x, y, intensity
-    Organized as: output_dir/sample_id/channel_name.parquet
+Output formats:
+    --output-format single-file (default, recommended):
+        Creates one parquet file per image with all channels as columns.
+        Output: output_dir/sample_id.parquet
+        Columns: x, y, <channel_name_1>, <channel_name_2>, ...
+        Preserves original channel names exactly (no filesystem restrictions).
+
+    --output-format per-channel (legacy):
+        Creates per-channel parquet files with columns: x, y, intensity
+        Output: output_dir/sample_id/channel_name.parquet
+        Channel names are sanitized for filesystem compatibility.
 """
 
 import argparse
@@ -108,13 +116,73 @@ def extract_single_channel(
     return channel_name, df, len(df)
 
 
+def extract_all_channels_combined(
+    filepath: Path,
+    min_intensity: float,
+    channel_names: List[str],
+) -> Tuple[pd.DataFrame, int]:
+    """Extract all channels and combine into a single wide DataFrame.
+
+    Each unique (x, y) coordinate gets one row, with each channel as a column.
+    Only coordinates where at least one channel exceeds min_intensity are kept.
+
+    Returns:
+        Tuple of (combined DataFrame, total non-null values)
+    """
+    with tifffile.TiffFile(filepath) as tif:
+        # Load full image data
+        data = tif.asarray()
+
+    if len(data.shape) == 2:
+        # Single channel image
+        data = data[np.newaxis, ...]
+
+    n_channels, height, width = data.shape
+
+    # Create mask of any pixel above threshold in any channel
+    combined_mask = np.any(data > min_intensity, axis=0)
+    y_coords, x_coords = np.where(combined_mask)
+
+    if len(x_coords) == 0:
+        # No pixels above threshold
+        cols = {'x': np.array([], dtype=np.int32), 'y': np.array([], dtype=np.int32)}
+        for name in channel_names:
+            cols[name] = np.array([], dtype=np.float32)
+        return pd.DataFrame(cols), 0
+
+    # Build DataFrame with x, y and all channel values
+    result = {
+        'x': x_coords.astype(np.int32),
+        'y': y_coords.astype(np.int32),
+    }
+
+    total_values = 0
+    for i, name in enumerate(channel_names):
+        channel_values = data[i, y_coords, x_coords].astype(np.float32)
+        # Set values below threshold to NaN (sparse representation)
+        channel_values[channel_values <= min_intensity] = np.nan
+        result[name] = channel_values
+        total_values += np.sum(~np.isnan(channel_values))
+
+    df = pd.DataFrame(result)
+    return df, int(total_values)
+
+
 def process_single_image(
     filepath: Path,
     output_dir: Path,
     min_intensity: float,
     workers_channels: int,
+    output_format: str = 'single-file',
 ) -> Tuple[str, int, int, float]:
     """Process all channels from a single image file.
+
+    Args:
+        filepath: Path to OME-TIFF file
+        output_dir: Output directory
+        min_intensity: Minimum intensity threshold
+        workers_channels: Number of parallel workers for channels (per-channel mode only)
+        output_format: 'single-file' (one parquet per image) or 'per-channel' (legacy)
 
     Returns:
         Tuple of (sample_id, n_channels, total_pixels, elapsed_time)
@@ -123,8 +191,6 @@ def process_single_image(
 
     # Get sample ID from filename
     sample_id = filepath.stem.replace('.ome', '')
-    sample_dir = output_dir / sample_id
-    sample_dir.mkdir(parents=True, exist_ok=True)
 
     # Read metadata
     metadata = read_ome_tiff_metadata(filepath)
@@ -138,47 +204,68 @@ def process_single_image(
 
     logger.info(f"Processing {filepath.name}: {n_channels} channels")
 
-    total_pixels = 0
-    results = []
+    if output_format == 'single-file':
+        # New format: single parquet with all channels as columns
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    if workers_channels <= 1:
-        # Sequential channel processing
-        for i, name in enumerate(channel_names):
-            ch_name, df, n_px = extract_single_channel(
-                filepath, i, min_intensity, name
-            )
-            results.append((ch_name, df, n_px))
-    else:
-        # Parallel channel processing
-        with ProcessPoolExecutor(max_workers=workers_channels) as executor:
-            futures = {
-                executor.submit(
-                    extract_single_channel,
-                    filepath, i, min_intensity, name
-                ): i
-                for i, name in enumerate(channel_names)
-            }
+        df, total_values = extract_all_channels_combined(
+            filepath, min_intensity, channel_names
+        )
 
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    idx = futures[future]
-                    logger.error(f"Error processing channel {idx}: {e}")
-
-    # Save results
-    for ch_name, df, n_px in results:
-        # Clean channel name for filename
-        safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in str(ch_name))
-        output_path = sample_dir / f"{safe_name}.parquet"
+        output_path = output_dir / f"{sample_id}.parquet"
         df.to_parquet(output_path, index=False, compression='snappy')
-        total_pixels += n_px
 
-    elapsed = time.time() - start_time
-    logger.info(f"  Completed {sample_id}: {total_pixels:,} pixels in {elapsed:.1f}s")
+        elapsed = time.time() - start_time
+        logger.info(f"  Completed {sample_id}: {len(df):,} pixels, {total_values:,} values in {elapsed:.1f}s")
 
-    return sample_id, n_channels, total_pixels, elapsed
+        return sample_id, n_channels, total_values, elapsed
+
+    else:
+        # Legacy format: per-channel parquet files
+        sample_dir = output_dir / sample_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        total_pixels = 0
+        results = []
+
+        if workers_channels <= 1:
+            # Sequential channel processing
+            for i, name in enumerate(channel_names):
+                ch_name, df, n_px = extract_single_channel(
+                    filepath, i, min_intensity, name
+                )
+                results.append((ch_name, df, n_px))
+        else:
+            # Parallel channel processing
+            with ProcessPoolExecutor(max_workers=workers_channels) as executor:
+                futures = {
+                    executor.submit(
+                        extract_single_channel,
+                        filepath, i, min_intensity, name
+                    ): i
+                    for i, name in enumerate(channel_names)
+                }
+
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        idx = futures[future]
+                        logger.error(f"Error processing channel {idx}: {e}")
+
+        # Save results
+        for ch_name, df, n_px in results:
+            # Clean channel name for filename
+            safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in str(ch_name))
+            output_path = sample_dir / f"{safe_name}.parquet"
+            df.to_parquet(output_path, index=False, compression='snappy')
+            total_pixels += n_px
+
+        elapsed = time.time() - start_time
+        logger.info(f"  Completed {sample_id}: {total_pixels:,} pixels in {elapsed:.1f}s")
+
+        return sample_id, n_channels, total_pixels, elapsed
 
 
 def batch_extract(
@@ -188,6 +275,7 @@ def batch_extract(
     min_intensity: float,
     workers_images: int,
     workers_channels: int,
+    output_format: str = 'single-file',
 ) -> List[dict]:
     """Extract intensities from all matching files in a directory."""
     # Find input files
@@ -199,8 +287,12 @@ def batch_extract(
 
     logger.info(f"Found {len(input_files)} files to process")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Output format: {output_format}")
     logger.info(f"Min intensity threshold: {min_intensity}")
-    logger.info(f"Workers: {workers_images} images, {workers_channels} channels")
+    if output_format == 'per-channel':
+        logger.info(f"Workers: {workers_images} images, {workers_channels} channels")
+    else:
+        logger.info(f"Workers: {workers_images} images")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -211,7 +303,7 @@ def batch_extract(
         for filepath in input_files:
             try:
                 sample_id, n_ch, n_px, elapsed = process_single_image(
-                    filepath, output_dir, min_intensity, workers_channels
+                    filepath, output_dir, min_intensity, workers_channels, output_format
                 )
                 results.append({
                     'sample_id': sample_id,
@@ -233,7 +325,7 @@ def batch_extract(
             futures = {
                 executor.submit(
                     process_single_image,
-                    filepath, output_dir, min_intensity, workers_channels
+                    filepath, output_dir, min_intensity, workers_channels, output_format
                 ): filepath
                 for filepath in input_files
             }
@@ -287,19 +379,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract glycan intensities
+  # Extract glycan intensities (default: single-file format)
   python script01_intensity_extraction.py \\
       --input-dir /data/msi/glycans \\
       --output-dir /out/glycans_parquet \\
       --modality glycans
 
-  # Extract with custom settings
+  # Extract with parallel processing
   python script01_intensity_extraction.py \\
       --input-dir /data/msi/metabolites \\
       --output-dir /out/metab_parquet \\
       --modality metabolites \\
-      --pattern "*.ome.tif" \\
       --min-intensity 0.5 \\
+      --workers-images 4
+
+  # Legacy per-channel format (for backward compatibility)
+  python script01_intensity_extraction.py \\
+      --input-dir /data/msi/peptides \\
+      --output-dir /out/peptides_parquet \\
+      --modality peptides \\
+      --output-format per-channel \\
       --workers-images 4 \\
       --workers-channels 8
         """
@@ -345,7 +444,14 @@ Examples:
         '--workers-channels',
         type=int,
         default=1,
-        help='Number of parallel workers for processing channels (default: 1)'
+        help='Number of parallel workers for processing channels (per-channel mode only, default: 1)'
+    )
+    parser.add_argument(
+        '--output-format', '-f',
+        type=str,
+        choices=['single-file', 'per-channel'],
+        default='single-file',
+        help='Output format: single-file (one parquet per image, recommended) or per-channel (legacy). Default: single-file'
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -374,6 +480,7 @@ Examples:
         min_intensity=args.min_intensity,
         workers_images=args.workers_images,
         workers_channels=args.workers_channels,
+        output_format=args.output_format,
     )
 
     # Exit with error code if any failed

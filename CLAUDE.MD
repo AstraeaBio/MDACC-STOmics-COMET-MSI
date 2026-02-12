@@ -28,7 +28,7 @@ Mass Spectrometry Imaging (MSI) analysis
 Comprehensive MSI analysis pipeline supporting glycans, peptides, and metabolites:
 
 - `script01_intensity_extraction.py` - **CLI tool** for batch extraction from OME-TIFF
-- `script02_create_anndata.ipynb` - Merge channels, create AnnData objects
+- `script02_create_anndata.ipynb` - Create AnnData objects (auto-detects input format)
 - `script03_preprocessing_qc.ipynb` - QC, normalization (RobustScaler/z-score), filtering
 - `script04_spatial_analysis.ipynb` - Moran's I spatial autocorrelation
 - `script05_clustering.ipynb` - PCA, UMAP, Leiden clustering
@@ -290,19 +290,37 @@ The Visiopharm segmentation TIFF files are processed to extract cell boundaries 
 #### script01_intensity_extraction.py
 **Output location**: `~/ext_hd_sammy/projects/out/out_msi/{modality}_parquet/`
 
-**Files generated**:
-- `{sample_id}/{channel_name}.parquet` - Per-channel intensity files
-  - Columns: `x`, `y`, `intensity`
-  - Only pixels above min_intensity threshold
-- `extraction_summary.csv` - Processing summary
+**Output formats** (controlled by `--output-format` flag):
+
+1. **Single-file format** (default, recommended):
+   - `{sample_id}.parquet` - One file per image with all channels as columns
+   - Columns: `x`, `y`, `<channel_name_1>`, `<channel_name_2>`, ...
+   - Preserves original channel names exactly (no filesystem restrictions)
+   - Values below threshold stored as NaN
+
+2. **Per-channel format** (legacy, `--output-format per-channel`):
+   - `{sample_id}/{channel_name}.parquet` - Per-channel intensity files
+   - Columns: `x`, `y`, `intensity`
+   - Channel names sanitized for filesystem compatibility
+
+- `extraction_summary.csv` - Processing summary (both formats)
 
 **CLI Usage**:
 ```bash
+# Default: single-file format (recommended)
 python script01_intensity_extraction.py \
     --input-dir /path/to/tiffs \
     --output-dir /path/to/output \
     --modality glycans \
     --min-intensity 1.0 \
+    --workers-images 4
+
+# Legacy: per-channel format
+python script01_intensity_extraction.py \
+    --input-dir /path/to/tiffs \
+    --output-dir /path/to/output \
+    --modality glycans \
+    --output-format per-channel \
     --workers-images 4 \
     --workers-channels 8
 ```

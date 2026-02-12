@@ -19,6 +19,21 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _make_serializable(value):
+    """Convert values to AnnData-writable (JSON-serializable) types."""
+    if isinstance(value, tuple):
+        return [_make_serializable(v) for v in value]
+    if isinstance(value, list):
+        return [_make_serializable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _make_serializable(v) for k, v in value.items()}
+    return value
+
+
 def robust_scale(
     data: np.ndarray,
     quantile_range: Tuple[float, float] = (0.05, 0.95),
@@ -233,7 +248,7 @@ def normalize_anndata(
     # Log the normalization
     adata.uns['normalization'] = {
         'method': method,
-        'parameters': kwargs,
+        'parameters': _make_serializable(kwargs),
     }
 
     logger.info(f"Applied {method} normalization")
