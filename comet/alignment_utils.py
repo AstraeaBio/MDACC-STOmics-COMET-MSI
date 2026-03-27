@@ -195,6 +195,30 @@ class DefaultPaths:
         return ssdna_dir / f'{chip_id}.bin200_1.0.spatial.cluster.h5ad'
 
     @classmethod
+    def label_geojson_path(cls, sample_id):
+        """Path to label GeoJSON (cells with phenotype classifications)."""
+        return cls.VIS_DIR / 'geojson' / f'{sample_id}_BS_label.geojson'
+
+    @classmethod
+    def roi_geojson_path(cls, sample_id):
+        """Path to ROI GeoJSON (tissue subregions)."""
+        return cls.VIS_DIR / 'geojson' / f'{sample_id}_BS_roi.geojson'
+
+    @classmethod
+    def stomics_microbiome_gef_path(cls, chip_id):
+        """Path to microbiome GEF (host + microbial taxa, bin1).
+
+        Searches 02.Microbiome_analysis/ under all known chip directories.
+        """
+        for root in [cls.BASE] + cls.STOMICS_ALT_ROOTS:
+            chip_dir = root / chip_id
+            micro_gef = chip_dir / '02.Microbiome_analysis' / f'{chip_id}.host_micro.label.gef'
+            if micro_gef.exists():
+                return micro_gef
+        # Return default path
+        return cls.BASE / chip_id / '02.Microbiome_analysis' / f'{chip_id}.host_micro.label.gef'
+
+    @classmethod
     def stomics_tissue_gef_path(cls, chip_id):
         """Path to bin1 tissue GEF (searches StandardWorkflow and ssDNA dirs).
 
@@ -336,13 +360,25 @@ def rasterize_geojson_to_mask(geojson_data, mask_shape, output_path=None):
     Each polygon is filled with its cell label value. Background is 0.
     Used as input for geftools generateCgef or direct transcript assignment.
 
+    Supports two GeoJSON formats:
+        - "masks" format: properties.label (from visiopharm_to_geojson)
+        - "label" format: properties.object_index (from mld_to_geojson)
+          For label format, uses object_index + 1 as the mask value (0 = background).
+          Features with classification.name == "Background" are skipped.
+
+    Also builds and returns a cell_id → phenotype mapping when classification
+    data is present in the GeoJSON features.
+
     Args:
         geojson_data: GeoJSON FeatureCollection dict (warped to STOmics coords)
         mask_shape: (height, width) tuple matching STOmics DAPI dimensions
         output_path: Optional path to save mask as compressed TIFF
 
     Returns:
-        np.ndarray: uint32 mask of shape (height, width)
+        tuple: (mask, phenotype_map)
+            mask: np.ndarray uint32 of shape (height, width)
+            phenotype_map: dict {cell_id: phenotype_str} or None if no
+                           classification data present
     """
     import cv2
 
@@ -354,12 +390,42 @@ def rasterize_geojson_to_mask(geojson_data, mask_shape, output_path=None):
 
     n_rasterized = 0
     n_skipped = 0
+    n_background = 0
+    phenotype_map = {}
+    has_classification = False
 
     for feature in features:
-        label = feature['properties'].get('label', None)
-        if label is None or label == 0:
+        props = feature['properties']
+
+        # Skip Background features (label format)
+        classification = props.get('classification')
+        if isinstance(classification, dict):
+            class_name = classification.get('name', '')
+            if class_name == 'Background':
+                n_background += 1
+                continue
+            has_classification = True
+        else:
+            class_name = None
+
+        # Determine cell ID: prefer 'label' (masks format), fall back to
+        # 'object_index' + 1 (label format, +1 because 0 = background)
+        label = props.get('label')
+        if label is None:
+            obj_idx = props.get('object_index')
+            if obj_idx is not None:
+                label = obj_idx + 1
+            else:
+                n_skipped += 1
+                continue
+
+        if label == 0:
             n_skipped += 1
             continue
+
+        # Record phenotype mapping
+        if class_name is not None:
+            phenotype_map[int(label)] = class_name if class_name != 'Cell' else 'Unclassified'
 
         coords = feature['geometry']['coordinates']
         exterior = np.array(coords[0], dtype=np.float64)
@@ -388,14 +454,133 @@ def rasterize_geojson_to_mask(geojson_data, mask_shape, output_path=None):
 
     n_unique = len(np.unique(mask)) - 1  # exclude background
     logger.info(f"Rasterized {n_rasterized} cells, {n_skipped} skipped, "
+                f"{n_background} background excluded, "
                 f"{n_unique} unique labels in mask")
+    if has_classification:
+        from collections import Counter
+        pheno_counts = Counter(phenotype_map.values())
+        logger.info(f"Phenotype distribution ({len(pheno_counts)} classes): "
+                    f"{dict(pheno_counts.most_common(5))}...")
 
     if output_path is not None:
         import tifffile
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(output_path), mask, compression='lzw')
+        try:
+            tifffile.imwrite(str(output_path), mask, compression='lzw')
+        except KeyError:
+            tifffile.imwrite(str(output_path), mask, compression='zlib')
         logger.info(f"Saved mask to {output_path} "
+                     f"({output_path.stat().st_size / 1e6:.1f} MB)")
+
+    return mask, (phenotype_map if has_classification else None)
+
+
+def rasterize_roi_to_mask(roi_geojson_data, mask_shape, output_path=None):
+    """Rasterize ROI GeoJSON polygons into a categorical uint8 mask.
+
+    Each pixel is labeled with its ROI class. Overlaps use priority-based
+    overwriting: Other (lowest) → TME → Tumor → Vessels (highest).
+
+    Args:
+        roi_geojson_data: ROI GeoJSON FeatureCollection dict (warped to
+            STOmics coords). Features must have classification.name matching
+            one of: "Tumor ROI", "TME ROI", "Vessels ROI", "Other ROI".
+        mask_shape: (height, width) tuple matching STOmics DAPI dimensions
+        output_path: Optional path to save mask as compressed TIFF
+
+    Returns:
+        np.ndarray: uint8 mask of shape (height, width) with values:
+            0 = Outside ROI, 1 = Tumor ROI, 2 = TME ROI,
+            3 = Vessels ROI, 4 = Other ROI
+    """
+    import cv2
+
+    height, width = mask_shape
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    roi_name_to_val = {
+        'Other ROI': 4,
+        'TME ROI': 2,
+        'Tumor ROI': 1,
+        'Vessels ROI': 3,
+    }
+
+    features = roi_geojson_data['features']
+    logger.info(f"Rasterizing {len(features)} ROI polygons to mask ({height}x{width})")
+
+    # Group features by class for priority-ordered rasterization
+    # Rasterize in order: Other → TME → Tumor → Vessels (last wins)
+    raster_order = ['Other ROI', 'TME ROI', 'Tumor ROI', 'Vessels ROI']
+    features_by_class = {name: [] for name in raster_order}
+    n_skipped = 0
+
+    for feature in features:
+        props = feature['properties']
+        classification = props.get('classification')
+        if isinstance(classification, dict):
+            class_name = classification.get('name', '')
+        else:
+            class_name = props.get('name', '')
+
+        if class_name in features_by_class:
+            features_by_class[class_name].append(feature)
+        else:
+            n_skipped += 1
+
+    for class_name in raster_order:
+        class_features = features_by_class[class_name]
+        if not class_features:
+            continue
+        val = roi_name_to_val[class_name]
+
+        for feature in class_features:
+            coords = feature['geometry']['coordinates']
+
+            # Handle both Polygon and MultiPolygon
+            geom_type = feature['geometry'].get('type', 'Polygon')
+            if geom_type == 'MultiPolygon':
+                polygon_list = coords
+            else:
+                polygon_list = [coords]
+
+            for poly_coords in polygon_list:
+                exterior = np.array(poly_coords[0], dtype=np.float64)
+                pts = np.round(exterior).astype(np.int32)
+                pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
+                pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
+                cv2.fillPoly(mask, [pts], int(val))
+
+                # Handle holes
+                for hole_coords in poly_coords[1:]:
+                    hole = np.round(np.array(hole_coords, dtype=np.float64)).astype(np.int32)
+                    hole[:, 0] = np.clip(hole[:, 0], 0, width - 1)
+                    hole[:, 1] = np.clip(hole[:, 1], 0, height - 1)
+                    cv2.fillPoly(mask, [hole], 0)
+
+        logger.info(f"  {class_name}: {len(class_features)} polygons (val={val})")
+
+    # Summary
+    from collections import Counter
+    val_counts = Counter(mask.ravel())
+    roi_val_to_name = {0: 'Outside', 1: 'Tumor', 2: 'TME', 3: 'Vessels', 4: 'Other'}
+    coverage = {roi_val_to_name.get(v, f'val{v}'): c
+                for v, c in val_counts.items() if v > 0}
+    total_roi_px = sum(c for v, c in val_counts.items() if v > 0)
+    logger.info(f"ROI coverage: {total_roi_px / (height * width) * 100:.1f}% of image")
+    logger.info(f"ROI pixel distribution: {coverage}")
+    if n_skipped:
+        logger.warning(f"Skipped {n_skipped} features with unrecognized class")
+
+    if output_path is not None:
+        import tifffile
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tifffile.imwrite(str(output_path), mask, compression='lzw')
+        except KeyError:
+            tifffile.imwrite(str(output_path), mask, compression='zlib')
+        logger.info(f"Saved ROI mask to {output_path} "
                      f"({output_path.stat().st_size / 1e6:.1f} MB)")
 
     return mask
@@ -1677,7 +1862,8 @@ def generate_cellbin_with_comet_mask(tissue_gef_path, mask_path, output_dir,
 # Direct Transcript-to-Cell Assignment (Path B: Python)
 # =============================================================================
 
-def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
+def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None,
+                                   phenotype_map=None, roi_mask=None):
     """Assign raw bin1 transcripts to COMET cells via mask lookup.
 
     For each DNB position in the tissue GEF, looks up the cell assignment
@@ -1688,9 +1874,16 @@ def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
         tissue_gef_path: Path to bin1 tissue.gef
         mask: uint32 mask array (height x width) or path to TIFF
         geojson_data: Optional warped GeoJSON for centroid/area metadata
+        phenotype_map: Optional dict {cell_id: phenotype_str} from
+            rasterize_geojson_to_mask. Populates obs['comet_phenotype'].
+        roi_mask: Optional uint8 ROI mask (same shape as cell mask).
+            Populates obs['roi_class'] and captures extracellular transcripts.
 
     Returns:
-        anndata.AnnData with COMET cells x genes
+        tuple: (adata, extracellular_df)
+            adata: anndata.AnnData with COMET cells x genes
+            extracellular_df: pd.DataFrame with per-ROI extracellular gene
+                counts, or None if roi_mask not provided
     """
     import h5py
     import anndata as ad
@@ -1722,14 +1915,25 @@ def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
 
         logger.info(f"Found {n_genes} genes, {expression.shape[0]} total DNB records")
 
+        # ROI class names for extracellular capture
+        roi_class_names = {1: 'Tumor ROI', 2: 'TME ROI', 3: 'Vessels ROI',
+                           4: 'Other ROI'}
+        collect_extracellular = roi_mask is not None
+
         # Process in gene-by-gene chunks for memory efficiency
         # Collect COO triplets: (cell_id, gene_idx, count)
         row_ids = []  # cell IDs
         col_ids = []  # gene indices
         vals = []     # counts
 
+        # Extracellular accumulators: {roi_class_int: {gene_idx: total_count}}
+        if collect_extracellular:
+            extra_counts = {k: np.zeros(n_genes, dtype=np.int64)
+                           for k in roi_class_names}
+
         total_assigned = 0
         total_outside = 0
+        total_extracellular = 0
 
         for gene_idx in range(n_genes):
             if gene_idx % 5000 == 0 and gene_idx > 0:
@@ -1763,15 +1967,32 @@ def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
                 vals.append(cnts_valid[assigned].astype(np.float32))
                 total_assigned += assigned.sum()
 
+            # Extracellular: not in any cell but within an ROI
+            if collect_extracellular:
+                not_assigned = ~assigned
+                if not_assigned.any():
+                    roi_ids = roi_mask[y_valid[not_assigned],
+                                       x_valid[not_assigned]]
+                    for roi_val in roi_class_names:
+                        in_roi = roi_ids == roi_val
+                        if in_roi.any():
+                            extra_counts[roi_val][gene_idx] += int(
+                                cnts_valid[not_assigned][in_roi].sum())
+                            total_extracellular += int(in_roi.sum())
+
             total_outside += (~assigned).sum() + (~valid).sum()
 
     logger.info(f"Assigned {total_assigned} DNBs to cells, "
                 f"{total_outside} outside cells/bounds")
+    if collect_extracellular:
+        logger.info(f"Captured {total_extracellular} extracellular DNBs "
+                    f"within ROI regions")
 
     # Concatenate all triplets
     if not row_ids:
         logger.warning("No DNBs were assigned to any cell!")
-        return ad.AnnData()
+        empty = ad.AnnData()
+        return (empty, None) if collect_extracellular else (empty, None)
 
     all_cell_ids = np.concatenate(row_ids)
     all_gene_ids = np.concatenate(col_ids)
@@ -1800,29 +2021,69 @@ def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
     }
 
     # Add centroid and area from GeoJSON if available
+    # Supports both "masks" format (properties.label) and "label" format
+    # (properties.object_index)
     if geojson_data is not None:
         label_to_props = {}
         for feature in geojson_data['features']:
-            label = feature['properties'].get('label')
+            props = feature['properties']
+            label = props.get('label')
+            if label is None:
+                obj_idx = props.get('object_index')
+                if obj_idx is not None:
+                    label = obj_idx + 1
             if label is not None:
                 coords = np.array(feature['geometry']['coordinates'][0])
                 cx = np.mean(coords[:-1, 0])
                 cy = np.mean(coords[:-1, 1])
-                area = feature['properties'].get('area_px', 0)
+                area = props.get('area_px', 0)
                 label_to_props[int(label)] = (cx, cy, area)
 
         centroids_x = []
         centroids_y = []
         areas = []
         for cid in unique_cells:
-            props = label_to_props.get(int(cid), (np.nan, np.nan, 0))
-            centroids_x.append(props[0])
-            centroids_y.append(props[1])
-            areas.append(props[2])
+            lprops = label_to_props.get(int(cid), (np.nan, np.nan, 0))
+            centroids_x.append(lprops[0])
+            centroids_y.append(lprops[1])
+            areas.append(lprops[2])
 
         obs_data['centroid_x'] = centroids_x
         obs_data['centroid_y'] = centroids_y
         obs_data['area_px'] = areas
+
+    # Add COMET phenotype from phenotype_map
+    if phenotype_map:
+        obs_data['comet_phenotype'] = [
+            phenotype_map.get(int(cid), 'Unknown')
+            for cid in unique_cells
+        ]
+        from collections import Counter
+        pheno_dist = Counter(obs_data['comet_phenotype'])
+        logger.info(f"Phenotype assignment: {len(pheno_dist)} classes, "
+                    f"top 5: {dict(pheno_dist.most_common(5))}")
+
+    # Assign cells to ROI regions based on centroid position
+    if roi_mask is not None and 'centroid_x' in obs_data:
+        roi_class_names_full = {0: 'Outside ROI', 1: 'Tumor ROI',
+                                2: 'TME ROI', 3: 'Vessels ROI',
+                                4: 'Other ROI'}
+        roi_labels = []
+        roi_h, roi_w = roi_mask.shape
+        for cx, cy in zip(obs_data['centroid_x'], obs_data['centroid_y']):
+            if np.isnan(cx) or np.isnan(cy):
+                roi_labels.append('Unknown')
+            else:
+                rx, ry = int(round(cx)), int(round(cy))
+                if 0 <= rx < roi_w and 0 <= ry < roi_h:
+                    roi_val = int(roi_mask[ry, rx])
+                    roi_labels.append(roi_class_names_full.get(roi_val,
+                                                               'Outside ROI'))
+                else:
+                    roi_labels.append('Outside ROI')
+        obs_data['roi_class'] = roi_labels
+        roi_dist = Counter(roi_labels)
+        logger.info(f"ROI assignment: {dict(roi_dist)}")
 
     obs = pd.DataFrame(obs_data, index=[str(i) for i in range(n_cells)])
     var = pd.DataFrame(index=gene_names)
@@ -1844,7 +2105,127 @@ def aggregate_transcripts_by_mask(tissue_gef_path, mask, geojson_data=None):
     logger.info(f"  Median transcripts/cell: {np.median(obs_data['n_transcripts']):.0f}")
     logger.info(f"  Median genes/cell: {np.median(obs_data['n_genes']):.0f}")
 
-    return adata
+    # Build extracellular DataFrame
+    extracellular_df = None
+    if collect_extracellular:
+        extra_data = {}
+        for roi_val, roi_name in roi_class_names.items():
+            total = int(extra_counts[roi_val].sum())
+            if total > 0:
+                extra_data[roi_name] = extra_counts[roi_val]
+        if extra_data:
+            extracellular_df = pd.DataFrame(extra_data, index=gene_names)
+            logger.info(f"Extracellular transcripts by ROI:")
+            for col in extracellular_df.columns:
+                total = int(extracellular_df[col].sum())
+                n_genes_detected = int((extracellular_df[col] > 0).sum())
+                logger.info(f"  {col}: {total:,} transcripts, "
+                           f"{n_genes_detected} genes")
+        adata.uns['total_extracellular'] = int(total_extracellular)
+
+    return adata, extracellular_df
+
+
+# Microbial taxa prefixes used in STOmics microbiome GEF
+MICROBIAL_PREFIXES = ('g__', 's__', 'f__', 'o__', 'c__', 'p__')
+
+
+def integrate_microbiome(adata, microbiome_gef_path, cell_mask, roi_mask=None):
+    """Assign microbial taxa from microbiome GEF to cells in an existing AnnData.
+
+    Runs aggregate_transcripts_by_mask on the microbiome GEF using the same
+    cell mask, then separates microbial taxa from human genes and stores the
+    microbial per-cell matrix in adata.obsm['microbiome'].
+
+    Args:
+        adata: AnnData from aggregate_transcripts_by_mask (human transcripts)
+        microbiome_gef_path: Path to {chip}.host_micro.label.gef
+        cell_mask: uint32 cell mask (same as used for human transcripts)
+        roi_mask: Optional uint8 ROI mask for extracellular microbiome capture
+
+    Returns:
+        tuple: (adata, micro_extracellular_df)
+            adata: Input AnnData with .obsm['microbiome'] added and
+                obs['n_microbial_reads'] populated
+            micro_extracellular_df: Extracellular microbiome DataFrame or None
+    """
+    microbiome_gef_path = Path(microbiome_gef_path)
+    if not microbiome_gef_path.exists():
+        logger.warning(f"Microbiome GEF not found: {microbiome_gef_path}")
+        return adata, None
+
+    logger.info(f"Processing microbiome GEF: {microbiome_gef_path.name}")
+
+    micro_adata, micro_extra = aggregate_transcripts_by_mask(
+        microbiome_gef_path, cell_mask, roi_mask=roi_mask
+    )
+
+    if micro_adata.n_obs == 0:
+        logger.warning("No cells received microbiome reads")
+        return adata, micro_extra
+
+    # Identify microbial taxa by prefix
+    gene_names = list(micro_adata.var_names)
+    is_microbial = np.array([any(g.startswith(p) for p in MICROBIAL_PREFIXES)
+                             for g in gene_names])
+    micro_idx = np.where(is_microbial)[0]
+    n_micro = len(micro_idx)
+    n_human = len(gene_names) - n_micro
+    logger.info(f"Microbiome GEF: {n_human} human genes, {n_micro} microbial taxa")
+
+    if n_micro == 0:
+        logger.warning("No microbial taxa found in microbiome GEF")
+        return adata, micro_extra
+
+    # Extract microbial matrix for cells that match the main adata
+    micro_taxa_names = [gene_names[i] for i in micro_idx]
+
+    # Build cell_label → row_index mapping for micro_adata
+    micro_labels = micro_adata.obs['cell_label'].values
+    micro_label_to_idx = {int(lbl): idx for idx, lbl in enumerate(micro_labels)}
+
+    # For each cell in adata, look up its microbial counts
+    main_labels = adata.obs['cell_label'].values
+    n_main_cells = len(main_labels)
+    micro_matrix = np.zeros((n_main_cells, n_micro), dtype=np.float32)
+    n_matched = 0
+
+    micro_X = micro_adata.X[:, micro_idx]
+    for i, lbl in enumerate(main_labels):
+        micro_row = micro_label_to_idx.get(int(lbl))
+        if micro_row is not None:
+            row_data = micro_X[micro_row, :].toarray().ravel() \
+                if hasattr(micro_X, 'toarray') else micro_X[micro_row, :]
+            micro_matrix[i, :] = row_data
+            n_matched += 1
+
+    adata.obsm['microbiome'] = micro_matrix
+    adata.uns['microbiome_taxa'] = micro_taxa_names
+
+    # Summary stats
+    total_per_cell = micro_matrix.sum(axis=1)
+    adata.obs['n_microbial_reads'] = total_per_cell.astype(int)
+    cells_with_microbes = (total_per_cell > 0).sum()
+
+    logger.info(f"Microbiome integration: {n_matched}/{n_main_cells} cells matched")
+    logger.info(f"  Cells with microbial reads: {cells_with_microbes}")
+    logger.info(f"  Total microbial reads: {int(total_per_cell.sum())}")
+    if cells_with_microbes > 0:
+        positive = total_per_cell[total_per_cell > 0]
+        logger.info(f"  Median reads (positive cells): {np.median(positive):.0f}")
+
+    # Filter extracellular to microbial-only
+    micro_extracellular_df = None
+    if micro_extra is not None:
+        micro_extra_taxa = micro_extra.loc[micro_extra.index.isin(micro_taxa_names)]
+        if micro_extra_taxa.sum().sum() > 0:
+            micro_extracellular_df = micro_extra_taxa
+            logger.info(f"Extracellular microbiome by ROI:")
+            for col in micro_extracellular_df.columns:
+                total = int(micro_extracellular_df[col].sum())
+                logger.info(f"  {col}: {total:,} microbial reads")
+
+    return adata, micro_extracellular_df
 
 
 # =============================================================================
