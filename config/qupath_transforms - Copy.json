@@ -1,0 +1,66 @@
+{
+  "_comment": "QuPath manual affine transforms. Each 2x3 matrix maps FROM the reference TO the source (QuPath's default direction when you drag the source onto the reference). Set invert=true (default when omitted) to reverse for forward warping into reference space. Reference for all samples: STOmics DAPI.",
+  "_usage": "Paste two rows of 3 numbers from QuPath's affine transform output. The pipeline will auto-invert to get the forward (source→reference) direction.",
+  "SO1": {
+    "reference": "stomics_dapi",
+    "reference_image": "ssDNA_D03453A6_regist.tif",
+    "transforms": {
+      "comet": {
+        "matrix": [
+          [0.0750, -2.2465, 43170.1727],
+          [-2.2465, -0.0750, 45168.2936]
+        ],
+        "invert": true,
+        "ecc_warp_mode": "euclidean",
+        "notes": "QuPath 0.6.0, STOmics DAPI to COMET, 2026-03-15, v2 refined"
+      },
+      "he": {
+        "matrix": [
+          [1.2048, -0.1977, 3952.2410],
+          [-0.1977, -1.2048, 30025.6530]
+        ],
+        "invert": true,
+        "notes": "QuPath 0.6.0, STOmics DAPI to NDPI H&E, 2026-03-15"
+      },
+      "msi_peptide": {
+        "matrix": [
+          [0.0042, 0.0258, 36.7676],
+          [0.0258, -0.0042, 17.8541]
+        ],
+        "invert": true,
+        "notes": "QuPath 0.6.0, STOmics DAPI to peptides, 2026-03-15"
+      },
+      "msi_glycan": {
+        "matrix": [
+          [0.0042, 0.0258, 36.7676],
+          [0.0258, -0.0042, 17.8541]
+        ],
+        "invert": true,
+        "notes": "Same as peptides - TBC if separate alignment needed"
+      },
+      "msi_metabolite": {
+        "matrix": [
+          [0.0042, 0.0258, 36.7676],
+          [0.0258, -0.0042, 17.8541]
+        ],
+        "invert": true,
+        "notes": "Same as peptides - TBC if separate alignment needed"
+      }
+    }
+  },
+  "SO34_EXAMPLE": {
+    "reference": "stomics_dapi",
+    "reference_image": "ssDNA_A03979E2_regist.tif",
+    "transforms": {
+      "comet": {
+        "matrix": [
+          [1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0]
+        ],
+        "invert": true,
+        "ecc_warp_mode": "euclidean",
+        "notes": "EXAMPLE ONLY - replace with actual QuPath values"
+      }
+    }
+  }
+}

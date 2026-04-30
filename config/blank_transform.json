@@ -1,0 +1,43 @@
+
+  "SO45": {
+    "reference": "stomics_dapi",
+    "reference_image": "ssDNA_A04100A6_regist.tif",
+    "transforms": {
+      "comet": {
+        "matrix": [
+          [],
+          []
+        ],
+        "invert": true,
+        "ecc_warp_mode": "euclidean"
+      },
+      "he": {
+        "matrix": [
+          [],
+          []
+        ],
+        "invert": true
+      },
+      "msi_glycan": {
+        "matrix": [
+          [],
+          []
+        ],
+        "invert": true
+      },
+      "msi_peptide": {
+        "matrix": [
+          [],
+          []
+        ],
+        "invert": true
+      },
+      "msi_metabolite": {
+        "matrix": [
+          [],
+          []
+        ],
+        "invert": true
+      }
+    }
+  },
