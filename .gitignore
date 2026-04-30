@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_metadata/
+
+# IDE / Editor
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated outputs & logs
+*.log
+debug.log
+saw_data_audit.csv
+DATA_INVENTORY_MASTER.csv
+
+# Large data files (never commit)
+*.gef
+*.h5ad
+*.ndpi
+*.svs
+*.ome.tif
+*.ome.tiff
+*.bam
+*.fastq
+*.fastq.gz
+*.fq.gz
+*.tar.gz
+
+# Registration / pipeline outputs
+registration_output/
+validation_manifest.json
+test_output/
+graphify-out/
+
+# HTML exports of notebooks
+*.html
+!docs/**/*.html
+
+# Windows shortcuts
+*.lnk
+.graphifyignore
