@@ -1,0 +1,4 @@
+# Auto-strip Jupyter notebook outputs on commit
+# Requires nbstripout: pip install nbstripout && nbstripout --install
+*.ipynb filter=nbstripout
+*.ipynb diff=ipynb
